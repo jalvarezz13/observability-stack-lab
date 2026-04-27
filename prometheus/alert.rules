@@ -1,0 +1,30 @@
+groups:
+  - name: laboratorio
+    rules:
+
+      - alert: ApacheCaido
+        expr: up{job="apache"} == 0
+        for: 30s
+        labels:
+          severity: critical
+        annotations:
+          summary: "Apache no responde a Prometheus"
+          description: "El exporter de Apache lleva 30s sin métricas. ¿Se cayó WordPress?"
+
+      - alert: AltaCargaCPU
+        expr: 100 - (avg by (instance) (rate(node_cpu_seconds_total{mode="idle"}[2m])) * 100) > 80
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "CPU del host por encima del 80%"
+          description: "Uso medio de CPU > 80% durante 1 minuto en {{ $labels.instance }}"
+
+      - alert: MuchasPeticionesApache
+        expr: rate(apache_accesses_total[1m]) > 50
+        for: 30s
+        labels:
+          severity: info
+        annotations:
+          summary: "Apache recibiendo más de 50 req/s"
+          description: "Posible ataque de carga o test en marcha. Tasa actual: {{ $value }} req/s"

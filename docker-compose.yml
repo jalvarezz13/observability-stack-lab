@@ -1,0 +1,227 @@
+# Stack de observabilidad para WordPress
+# Levanta todo con: docker compose up -d
+# Tags fijados a versiones estables verificadas en Docker Hub el 27/abril/2026
+#
+# Servicios expuestos al host:
+#   - WordPress:        http://localhost:8080
+#   - Grafana:          http://localhost:3000   (admin / admin)
+#   - Prometheus:       http://localhost:9090
+#   - Loki:             http://localhost:3100
+#   - cAdvisor:         http://localhost:8081
+#   - Node Exporter:    http://localhost:9100/metrics
+#   - Apache Exporter:  http://localhost:9117/metrics
+#   - Alloy UI:         http://localhost:12345
+
+services:
+
+  # ========================================================================
+  # APLICACIÓN BAJO OBSERVACIÓN
+  # ========================================================================
+
+  mariadb:
+    image: mariadb:11.8
+    container_name: obs-mariadb
+    restart: unless-stopped
+    environment:
+      MARIADB_ROOT_PASSWORD: rootpassword
+      MARIADB_DATABASE: wordpress
+      MARIADB_USER: wordpress
+      MARIADB_PASSWORD: wordpress
+    volumes:
+      - mariadb_data:/var/lib/mysql
+    networks:
+      - obsnet
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  wordpress:
+    image: wordpress:6.9.4-php8.4-apache
+    container_name: obs-wordpress
+    restart: unless-stopped
+    depends_on:
+      mariadb:
+        condition: service_healthy
+    environment:
+      WORDPRESS_DB_HOST: mariadb:3306
+      WORDPRESS_DB_USER: wordpress
+      WORDPRESS_DB_PASSWORD: wordpress
+      WORDPRESS_DB_NAME: wordpress
+    ports:
+      - "8080:80"
+    volumes:
+      - wordpress_data:/var/www/html
+      - ./apache/status.conf:/etc/apache2/conf-enabled/status.conf:ro
+    # Habilita mod_status antes de arrancar Apache para que el exporter
+    # pueda leer /server-status?auto
+    command: >
+      bash -c "mkdir -p /var/www/empty && a2enmod status && docker-entrypoint.sh apache2-foreground"
+    networks:
+      - obsnet
+
+  # ========================================================================
+  # EXPORTERS (traducen métricas a formato Prometheus)
+  # ========================================================================
+
+  # Métricas del host: CPU, RAM, disco, red, carga
+  node-exporter:
+    image: prom/node-exporter:v1.11.1
+    container_name: obs-node-exporter
+    restart: unless-stopped
+    command:
+      - '--path.procfs=/host/proc'
+      - '--path.rootfs=/rootfs'
+      - '--path.sysfs=/host/sys'
+      - '--collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc)($$|/)'
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/rootfs:ro
+    ports:
+      - "9100:9100"
+    networks:
+      - obsnet
+
+  # Métricas por contenedor: CPU, RAM, red, IO de cada container.
+  # NOTA macOS/Windows: cAdvisor muestra métricas de la VM de Docker
+  # Desktop, no del host real. Es esperado y suficiente para el lab.
+  cadvisor:
+    image: gcr.io/cadvisor/cadvisor:v0.55.1
+    container_name: obs-cadvisor
+    restart: unless-stopped
+    privileged: true
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:ro
+      - /sys:/sys:ro
+      - /var/lib/docker:/var/lib/docker:ro
+    ports:
+      - "8081:8080"
+    networks:
+      - obsnet
+
+  # Métricas específicas de Apache via mod_status
+  apache-exporter:
+    image: lusotycoon/apache-exporter:v1.0.12
+    container_name: obs-apache-exporter
+    restart: unless-stopped
+    command:
+      - '--scrape_uri=http://wordpress:81/server-status?auto'
+    ports:
+      - "9117:9117"
+    depends_on:
+      - wordpress
+    networks:
+      - obsnet
+
+  # ========================================================================
+  # ALMACENAMIENTO + RECOLECCIÓN
+  # ========================================================================
+
+  # Base de datos de series temporales (métricas)
+  prometheus:
+    image: prom/prometheus:v3.11.3
+    container_name: obs-prometheus
+    restart: unless-stopped
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--storage.tsdb.retention.time=7d'
+      - '--web.enable-lifecycle'
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./prometheus/alert.rules:/etc/prometheus/alert.rules:ro
+      - prometheus_data:/prometheus
+    ports:
+      - "9090:9090"
+    networks:
+      - obsnet
+
+  # Almacén de logs (equivalente a Prometheus pero para logs)
+  loki:
+    image: grafana/loki:3.6.10
+    container_name: obs-loki
+    restart: unless-stopped
+    command: -config.file=/etc/loki/local-config.yaml
+    ports:
+      - "3100:3100"
+    networks:
+      - obsnet
+
+  # Recolector de logs de los contenedores Docker (sucesor oficial de Promtail)
+  alloy:
+    image: grafana/alloy:v1.16.0
+    container_name: obs-alloy
+    restart: unless-stopped
+    command:
+      - run
+      - --server.http.listen-addr=0.0.0.0:12345
+      - --storage.path=/var/lib/alloy/data
+      - /etc/alloy/config.alloy
+    volumes:
+      - ./alloy/config.alloy:/etc/alloy/config.alloy:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    ports:
+      - "12345:12345"
+    depends_on:
+      - loki
+    networks:
+      - obsnet
+
+  # ========================================================================
+  # VISUALIZACIÓN
+  # ========================================================================
+
+  grafana:
+    image: grafana/grafana:13.0.1
+    container_name: obs-grafana
+    restart: unless-stopped
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      # Plugin opcional para vistas de logs más bonitas
+      GF_INSTALL_PLUGINS: ""
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+    ports:
+      - "3000:3000"
+    depends_on:
+      - prometheus
+      - loki
+    networks:
+      - obsnet
+
+  # ========================================================================
+  # GENERADOR DE CARGA (perfil opcional)
+  # ========================================================================
+
+  # Se arranca solo con: docker compose --profile load up k6
+  k6:
+    image: grafana/k6:1.7.1
+    container_name: obs-k6
+    profiles: ["load"]
+    volumes:
+      - ./k6/load-test.js:/scripts/load-test.js:ro
+    command: run /scripts/load-test.js
+    depends_on:
+      - wordpress
+    networks:
+      - obsnet
+
+# ============================================================================
+# RED Y VOLÚMENES
+# ============================================================================
+
+networks:
+  obsnet:
+    driver: bridge
+
+volumes:
+  mariadb_data:
+  wordpress_data:
+  prometheus_data:
+  grafana_data:
